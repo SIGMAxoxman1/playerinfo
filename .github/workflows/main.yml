@@ -374,23 +374,21 @@ jobs:
           cat > src/main/java/com/inspectmod/data/PlayerTracker.java << 'EOF'
           package com.inspectmod.data;
 
-          import net.minecraft.enchantment.Enchantment;
-          import net.minecraft.enchantment.EnchantmentHelper;
+          import net.minecraft.component.DataComponentTypes;
+          import net.minecraft.component.type.BundleContentsComponent;
+          import net.minecraft.component.type.ContainerComponent;
           import net.minecraft.entity.player.PlayerEntity;
           import net.minecraft.item.ItemStack;
-          import net.minecraft.nbt.NbtCompound;
-          import net.minecraft.nbt.NbtList;
-          import net.minecraft.registry.entry.RegistryEntry;
 
           import java.util.*;
 
           /**
            * Scans nearby players every second and records
            * shulker boxes and bundles they're holding.
+           * Uses Data Components API (1.21.1+) — no getNbt().
            */
           public class PlayerTracker {
 
-              // Last seen containers per player (for change detection)
               private static final Map<String, String> lastSeenHash = new HashMap<>();
 
               public static void tick(Iterable<? extends PlayerEntity> nearbyPlayers) {
@@ -403,14 +401,14 @@ jobs:
                           if (stack.isEmpty()) continue;
                           String id = stack.getItem().toString();
 
-                          if (isShulker(id)) {
+                          if (ModConfig.trackShulkers && isShulker(id)) {
                               PlayerSnapshot.ContainerEntry entry = new PlayerSnapshot.ContainerEntry();
-                              entry.type   = "shulker";
-                              entry.color  = extractShulkerColor(id);
-                              entry.itemId = id;
+                              entry.type     = "shulker";
+                              entry.color    = extractShulkerColor(id);
+                              entry.itemId   = id;
                               entry.contents = readShulkerContents(stack);
                               found.add(entry);
-                          } else if (isBundle(id)) {
+                          } else if (ModConfig.trackBundles && isBundle(id)) {
                               PlayerSnapshot.ContainerEntry entry = new PlayerSnapshot.ContainerEntry();
                               entry.type     = "bundle";
                               entry.color    = "orange";
@@ -433,7 +431,6 @@ jobs:
                   }
               }
 
-              // ── Get all visible stacks from a player ─────────────
               private static List<ItemStack> getAllStacks(PlayerEntity player) {
                   List<ItemStack> stacks = new ArrayList<>();
                   stacks.add(player.getMainHandStack());
@@ -442,51 +439,38 @@ jobs:
                   return stacks;
               }
 
-              // ── Shulker detection ────────────────────────────────
-              private static boolean isShulker(String id) {
-                  return id.contains("shulker_box");
-              }
-
-              private static boolean isBundle(String id) {
-                  return id.contains("bundle");
-              }
+              private static boolean isShulker(String id) { return id.contains("shulker_box"); }
+              private static boolean isBundle(String id)  { return id.contains("bundle"); }
 
               private static String extractShulkerColor(String id) {
                   String[] colors = {"white","orange","magenta","light_blue","yellow",
                           "lime","pink","gray","light_gray","cyan","purple",
                           "blue","brown","green","red","black"};
                   for (String c : colors) if (id.contains(c)) return c;
-                  return "purple"; // default shulker color
+                  return "purple";
               }
 
-              // ── Read shulker contents from NBT ───────────────────
+              // ── Shulker: uses ContainerComponent (1.21.1 Data Components) ──
               private static List<String> readShulkerContents(ItemStack stack) {
                   List<String> contents = new ArrayList<>();
-                  NbtCompound nbt = stack.getNbt();
-                  if (nbt == null) return contents;
-                  NbtCompound blockTag = nbt.getCompound("BlockEntityTag");
-                  if (blockTag == null) return contents;
-                  NbtList items = blockTag.getList("Items", 10);
-                  if (items == null) return contents;
-                  for (int i = 0; i < items.size(); i++) {
-                      NbtCompound item = items.getCompound(i);
-                      String itemId = item.getString("id");
-                      int count     = item.getByte("Count");
-                      contents.add(cleanId(itemId) + (count > 1 ? " x" + count : ""));
+                  // CONTAINER component holds shulker box items in 1.21.1
+                  ContainerComponent container = stack.get(DataComponentTypes.CONTAINER);
+                  if (container == null) return contents;
+                  for (ItemStack item : container.iterateNonEmpty()) {
+                      contents.add(cleanId(item.getItem().toString())
+                              + (item.getCount() > 1 ? " x" + item.getCount() : ""));
                   }
                   return contents;
               }
 
-              // ── Read bundle contents from NBT ────────────────────
+              // ── Bundle: uses BundleContentsComponent ──────────────
               private static List<String> readBundleContents(ItemStack stack) {
                   List<String> contents = new ArrayList<>();
-                  NbtCompound nbt = stack.getNbt();
-                  if (nbt == null) return contents;
-                  NbtList items = nbt.getList("Items", 10);
-                  if (items == null) return contents;
-                  for (int i = 0; i < items.size(); i++) {
-                      NbtCompound item = items.getCompound(i);
-                      contents.add(cleanId(item.getString("id")));
+                  BundleContentsComponent bundle = stack.get(DataComponentTypes.BUNDLE_CONTENTS);
+                  if (bundle == null) return contents;
+                  for (ItemStack item : bundle.iterateNonEmpty()) {
+                      contents.add(cleanId(item.getItem().toString())
+                              + (item.getCount() > 1 ? " x" + item.getCount() : ""));
                   }
                   return contents;
               }
@@ -533,11 +517,12 @@ jobs:
 
           import net.minecraft.client.MinecraftClient;
           import net.minecraft.client.gui.DrawContext;
-          import net.minecraft.client.util.math.MatrixStack;
+          import net.minecraft.client.render.RenderTickCounter;
           import net.minecraft.enchantment.Enchantment;
           import net.minecraft.enchantment.EnchantmentHelper;
           import net.minecraft.entity.player.PlayerEntity;
           import net.minecraft.item.ItemStack;
+          import net.minecraft.item.tooltip.TooltipType;
           import net.minecraft.registry.entry.RegistryEntry;
 
           import java.util.*;
@@ -549,36 +534,30 @@ jobs:
            */
           public class InspectHud {
 
-              public static void render(DrawContext ctx, float tickDelta) {
+              // Called from HudRenderCallback — signature is (DrawContext, RenderTickCounter) in 1.21.1
+              public static void render(DrawContext ctx, RenderTickCounter counter) {
                   if (!ModConfig.hudEnabled) return;
                   MinecraftClient client = MinecraftClient.getInstance();
-                  if (client.world == null || client.player == null || client.gameRenderer == null) return;
+                  if (client.world == null || client.player == null) return;
 
                   for (PlayerEntity player : client.world.getPlayers()) {
                       if (player == client.player) continue;
-                      renderPlayerTag(ctx, client, player, tickDelta);
+                      renderPlayerTag(ctx, client, player);
                   }
               }
 
               private static void renderPlayerTag(DrawContext ctx, MinecraftClient client,
-                                                  PlayerEntity player, float tickDelta) {
-                  // Project player position to screen
-                  var camera = client.gameRenderer.getCamera();
-                  var matrices = ctx.getMatrices();
+                                                  PlayerEntity player) {
+                  // Distance check — only show within 32 blocks
+                  double dist = client.player.distanceTo(player);
+                  if (dist > 32) return;
 
-                  // Get player's eye position relative to camera
-                  double dx = player.getX() - camera.getPos().x;
-                  double dy = player.getY() + player.getHeight() + 0.5 - camera.getPos().y;
-                  double dz = player.getZ() - camera.getPos().z;
-                  double dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
-                  if (dist > 32) return; // Only show within 32 blocks
+                  int screenW = client.getWindow().getScaledWidth();
+                  int screenH = client.getWindow().getScaledHeight();
 
-                  // Use nameplate position approximation
-                  int[] screenPos = worldToScreen(client, player, tickDelta);
-                  if (screenPos == null) return;
-
-                  int sx = screenPos[0];
-                  int sy = screenPos[1] - 10;
+                  // Approximate screen center for the player nameplate
+                  int sx = screenW / 2;
+                  int sy = screenH / 2 - 40;
 
                   String name = player.getName().getString();
                   int nameW = client.textRenderer.getWidth(name);
@@ -588,9 +567,8 @@ jobs:
                   if (ModConfig.showMainHand && !mainHand.isEmpty()) {
                       int ix = sx - nameW / 2 - 20;
                       ctx.drawItem(mainHand, ix, sy - 8);
-                      if (ModConfig.showEnchantments) {
+                      if (ModConfig.showEnchantments)
                           drawEnchantments(ctx, client, mainHand, ix - 2, sy - 8, true);
-                      }
                   }
 
                   // ── Off hand (right of name) ─────────────────────
@@ -598,44 +576,43 @@ jobs:
                   if (ModConfig.showOffHand && !offHand.isEmpty()) {
                       int ix = sx + nameW / 2 + 4;
                       ctx.drawItem(offHand, ix, sy - 8);
-                      if (ModConfig.showEnchantments) {
+                      if (ModConfig.showEnchantments)
                           drawEnchantments(ctx, client, offHand, ix + 18, sy - 8, false);
-                      }
                   }
 
                   // ── Armor row ────────────────────────────────────
                   if (ModConfig.showArmor) {
-                      int armorY = sy + 2;
-                      int startX = sx - 32;
-                      String[] armorKeys = {"Helmet", "Chestplate", "Leggings", "Boots"};
-                      int ai = 0;
-                      // Iterate armor: helmet(3), chest(2), legs(1), boots(0)
+                      int armorY  = sy + 2;
+                      int startX  = sx - 32;
                       ItemStack[] armorArr = new ItemStack[4];
                       int idx = 0;
                       for (ItemStack a : player.getArmorItems()) armorArr[idx++] = a;
 
+                      int ai = 0;
                       for (int i = 3; i >= 0; i--) {
                           ItemStack a = armorArr[i];
                           if (a != null && !a.isEmpty()) {
                               int ax = startX + ai * 18;
                               ctx.drawItem(a, ax, armorY);
-                              if (ModConfig.showEnchantments) {
+                              if (ModConfig.showEnchantments)
                                   drawEnchantmentsBelow(ctx, client, a, ax, armorY + 16);
-                              }
                           }
                           ai++;
                       }
                   }
               }
 
+              // ── Draw enchantments left or right of an item icon ──
               private static void drawEnchantments(DrawContext ctx, MinecraftClient mc,
-                                                    ItemStack stack, int x, int y, boolean leftAlign) {
-                  Map<RegistryEntry<Enchantment>, Integer> enchs =
-                          EnchantmentHelper.getEnchantments(stack).getEnchantments();
+                                                   ItemStack stack, int x, int y, boolean leftAlign) {
+                  // In 1.21.1 getEnchantments() returns ItemEnchantmentsComponent
+                  // iterate with getEnchantmentEntries() which gives Set<RegistryEntry<Enchantment>>
+                  var component = EnchantmentHelper.getEnchantments(stack);
                   int ey = y;
-                  for (var entry : enchs.entrySet()) {
-                      String text = "§b" + shortEnch(entry.getKey().value()
-                              .description().getString()) + toRoman(entry.getValue());
+                  for (RegistryEntry<Enchantment> entry : component.getEnchantments()) {
+                      int level = component.getLevel(entry);
+                      String text = "§b" + shortEnch(entry.value().description().getString())
+                                  + " " + toRoman(level);
                       int tw = mc.textRenderer.getWidth(text);
                       int ex = leftAlign ? x - tw : x;
                       ctx.fill(ex - 1, ey - 1, ex + tw + 1, ey + 8, 0x88000000);
@@ -645,27 +622,26 @@ jobs:
               }
 
               private static void drawEnchantmentsBelow(DrawContext ctx, MinecraftClient mc,
-                                                         ItemStack stack, int x, int y) {
-                  Map<RegistryEntry<Enchantment>, Integer> enchs =
-                          EnchantmentHelper.getEnchantments(stack).getEnchantments();
+                                                        ItemStack stack, int x, int y) {
+                  var component = EnchantmentHelper.getEnchantments(stack);
                   int ey = y;
-                  for (var entry : enchs.entrySet()) {
-                      String text = "§b" + shortEnch(entry.getKey().value()
-                              .description().getString()) + toRoman(entry.getValue());
+                  for (RegistryEntry<Enchantment> entry : component.getEnchantments()) {
+                      int level = component.getLevel(entry);
+                      String text = "§b" + shortEnch(entry.value().description().getString())
+                                  + " " + toRoman(level);
                       ctx.fill(x - 1, ey - 1, x + 36, ey + 8, 0x88000000);
                       ctx.drawTextWithShadow(mc.textRenderer, text, x, ey, 0xFFFFFF);
                       ey += 9;
                   }
               }
 
-              // Abbreviate long enchantment names
               private static String shortEnch(String full) {
                   Map<String, String> abbr = Map.of(
-                      "Sharpness", "Sharp", "Protection", "Prot",
-                      "Unbreaking", "Unbr", "Efficiency", "Eff",
-                      "Fortune", "Fort", "Silk Touch", "Silk",
-                      "Power", "Pow", "Infinity", "Inf",
-                      "Mending", "Mend", "Looting", "Loot"
+                      "Sharpness",   "Sharp", "Protection", "Prot",
+                      "Unbreaking",  "Unbr",  "Efficiency", "Eff",
+                      "Fortune",     "Fort",  "Silk Touch", "Silk",
+                      "Power",       "Pow",   "Infinity",   "Inf",
+                      "Mending",     "Mend",  "Looting",    "Loot"
                   );
                   return abbr.getOrDefault(full, full.length() > 6 ? full.substring(0, 5) : full);
               }
@@ -673,17 +649,6 @@ jobs:
               private static String toRoman(int n) {
                   String[] r = {"","I","II","III","IV","V","VI","VII","VIII","IX","X"};
                   return (n >= 1 && n <= 10) ? r[n] : String.valueOf(n);
-              }
-
-              // Simple world-to-screen projection
-              private static int[] worldToScreen(MinecraftClient client, PlayerEntity player, float tickDelta) {
-                  try {
-                      int screenW = client.getWindow().getScaledWidth();
-                      int screenH = client.getWindow().getScaledHeight();
-                      return new int[]{screenW / 2, screenH / 2 - 40}; // Fallback center
-                  } catch (Exception e) {
-                      return null;
-                  }
               }
           }
           EOF
@@ -982,6 +947,7 @@ jobs:
           import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
           import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
           import net.minecraft.client.option.KeyBinding;
+          import net.minecraft.client.render.RenderTickCounter;
           import net.minecraft.client.util.InputUtil;
           import org.lwjgl.glfw.GLFW;
 
@@ -993,11 +959,9 @@ jobs:
 
               @Override
               public void onInitializeClient() {
-                  // Load saved data
                   StoredPlayerData.load();
                   StoredPlayerData.runAutoDelete();
 
-                  // Keybindings
                   openGuiKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
                       "key.inspectmod.open_gui", InputUtil.Type.KEYSYM,
                       GLFW.GLFW_KEY_G, "Inspect Mod"));
@@ -1006,21 +970,17 @@ jobs:
                       "key.inspectmod.toggle_hud", InputUtil.Type.KEYSYM,
                       GLFW.GLFW_KEY_H, "Inspect Mod"));
 
-                  // HUD render
-                  HudRenderCallback.EVENT.register((ctx, tickDelta) ->
-                      InspectHud.render(ctx, tickDelta));
+                  // In 1.21.1 HudRenderCallback passes (DrawContext, RenderTickCounter)
+                  HudRenderCallback.EVENT.register((ctx, counter) ->
+                      InspectHud.render(ctx, counter));
 
-                  // Tick: track players every 20 ticks (1 second)
                   ClientTickEvents.END_CLIENT_TICK.register(client -> {
-                      // Key: open main screen
                       while (openGuiKey.wasPressed())
                           client.setScreen(new MainScreen());
 
-                      // Key: toggle HUD
                       while (toggleHudKey.wasPressed())
                           ModConfig.hudEnabled = !ModConfig.hudEnabled;
 
-                      // Track shulkers/bundles every second
                       if (client.world != null && ++tickCounter >= 20) {
                           tickCounter = 0;
                           if (ModConfig.trackShulkers || ModConfig.trackBundles)
