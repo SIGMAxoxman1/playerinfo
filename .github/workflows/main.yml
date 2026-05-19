@@ -1,0 +1,1074 @@
+name: Build Inspect Mod (Self-Generating)
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ─────────────────────────────────────────────────────────
+      # 1. Checkout
+      # ─────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ─────────────────────────────────────────────────────────
+      # 2. Java 21
+      # ─────────────────────────────────────────────────────────
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      # ─────────────────────────────────────────────────────────
+      # 3. Generate ALL project files
+      # ─────────────────────────────────────────────────────────
+      - name: Generate project structure
+        run: |
+          mkdir -p src/main/java/com/inspectmod/client
+          mkdir -p src/main/java/com/inspectmod/data
+          mkdir -p src/main/java/com/inspectmod/mixin
+          mkdir -p src/main/resources
+          mkdir -p gradle/wrapper
+
+      # ── settings.gradle ──────────────────────────────────────
+      - name: Write settings.gradle
+        run: |
+          cat > settings.gradle << 'EOF'
+          pluginManagement {
+              repositories {
+                  maven { name = 'Fabric'; url = 'https://maven.fabricmc.net/' }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          rootProject.name = "inspect-mod"
+          EOF
+
+      # ── gradle.properties ────────────────────────────────────
+      - name: Write gradle.properties
+        run: |
+          cat > gradle.properties << 'EOF'
+          org.gradle.jvmargs=-Xmx2G
+          org.gradle.parallel=true
+          minecraft_version=1.21.1
+          yarn_mappings=1.21.1+build.3
+          loader_version=0.16.9
+          mod_version=1.0.0
+          maven_group=com.inspectmod
+          archives_base_name=inspect-mod
+          fabric_version=0.110.0+1.21.1
+          yacl_version=3.5.0+1.21
+          EOF
+
+      # ── build.gradle ─────────────────────────────────────────
+      - name: Write build.gradle
+        run: |
+          cat > build.gradle << 'EOF'
+          plugins {
+              id 'fabric-loom' version '1.7.4'
+              id 'maven-publish'
+          }
+          version = project.mod_version
+          group   = project.maven_group
+          base { archivesName = project.archives_base_name }
+          repositories {
+              mavenCentral()
+              maven { url "https://maven.isxander.dev/releases" }
+          }
+          dependencies {
+              minecraft       "com.mojang:minecraft:${project.minecraft_version}"
+              mappings        "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+              modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+              modImplementation "dev.isxander:yet-another-config-lib:${project.yacl_version}-fabric"
+              include         "dev.isxander:yet-another-config-lib:${project.yacl_version}-fabric"
+          }
+          processResources {
+              inputs.property "version", project.version
+              filesMatching("fabric.mod.json") { expand "version": project.version }
+          }
+          tasks.withType(JavaCompile).configureEach { it.options.release = 21 }
+          java {
+              withSourcesJar()
+              sourceCompatibility = JavaVersion.VERSION_21
+              targetCompatibility = JavaVersion.VERSION_21
+          }
+          EOF
+
+      # ── gradle wrapper ───────────────────────────────────────
+      - name: Setup Gradle wrapper
+        run: |
+          cat > gradle/wrapper/gradle-wrapper.properties << 'EOF'
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.10.2-bin.zip
+          networkTimeout=10000
+          validateDistributionUrl=true
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          EOF
+          curl -sL "https://raw.githubusercontent.com/gradle/gradle/v8.10.2/gradle/wrapper/gradle-wrapper.jar" \
+            -o gradle/wrapper/gradle-wrapper.jar || true
+          gradle wrapper --gradle-version 8.10.2 --distribution-type bin || true
+
+      # ── fabric.mod.json ──────────────────────────────────────
+      - name: Write fabric.mod.json
+        run: |
+          cat > src/main/resources/fabric.mod.json << 'EOF'
+          {
+            "schemaVersion": 1,
+            "id": "inspectmod",
+            "version": "${version}",
+            "name": "Inspect Mod",
+            "description": "See armor, enchantments, shulker and bundle contents of nearby players!",
+            "authors": ["YourName"],
+            "license": "MIT",
+            "environment": "client",
+            "entrypoints": {
+              "client": ["com.inspectmod.client.InspectModClient"]
+            },
+            "mixins": ["inspectmod.mixins.json"],
+            "depends": {
+              "fabricloader": ">=0.16.0",
+              "minecraft": "~1.21.1",
+              "java": ">=21",
+              "fabric-api": "*"
+            }
+          }
+          EOF
+
+      # ── mixins json ──────────────────────────────────────────
+      - name: Write mixins json
+        run: |
+          cat > src/main/resources/inspectmod.mixins.json << 'EOF'
+          {
+            "required": true,
+            "package": "com.inspectmod.mixin",
+            "compatibilityLevel": "JAVA_21",
+            "client": ["GameRendererMixin"],
+            "injectors": { "defaultRequire": 1 }
+          }
+          EOF
+
+      # ── StoredPlayerData.java ────────────────────────────────
+      - name: Write StoredPlayerData.java
+        run: |
+          cat > src/main/java/com/inspectmod/data/StoredPlayerData.java << 'EOF'
+          package com.inspectmod.data;
+
+          import com.google.gson.*;
+          import net.minecraft.client.MinecraftClient;
+
+          import java.io.*;
+          import java.nio.file.*;
+          import java.time.*;
+          import java.util.*;
+
+          /**
+           * Handles saving/loading player shulker+bundle data to disk.
+           * Recent  = seen within 24 hours
+           * Archive = 24h → 30 days (auto-deleted unless disabled)
+           */
+          public class StoredPlayerData {
+
+              public static final int ARCHIVE_DAYS = 30;
+              private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+              private static Path dataFile;
+
+              // In-memory store: playerName -> list of snapshots
+              public static final Map<String, List<PlayerSnapshot>> allData = new LinkedHashMap<>();
+
+              public static boolean autoDeleteEnabled = true;
+
+              // ── Load from disk ───────────────────────────────────
+              public static void load() {
+                  dataFile = getDataPath();
+                  if (!Files.exists(dataFile)) return;
+                  try {
+                      String json = Files.readString(dataFile);
+                      JsonObject root = JsonParser.parseString(json).getAsJsonObject();
+                      autoDeleteEnabled = root.has("autoDelete")
+                              && root.get("autoDelete").getAsBoolean();
+                      JsonObject players = root.getAsJsonObject("players");
+                      if (players == null) return;
+                      for (var entry : players.entrySet()) {
+                          List<PlayerSnapshot> snaps = new ArrayList<>();
+                          for (JsonElement el : entry.getValue().getAsJsonArray()) {
+                              snaps.add(PlayerSnapshot.fromJson(el.getAsJsonObject()));
+                          }
+                          allData.put(entry.getKey(), snaps);
+                      }
+                  } catch (Exception e) {
+                      System.err.println("[InspectMod] Failed to load data: " + e.getMessage());
+                  }
+              }
+
+              // ── Save to disk ─────────────────────────────────────
+              public static void save() {
+                  try {
+                      Files.createDirectories(dataFile.getParent());
+                      JsonObject root = new JsonObject();
+                      root.addProperty("autoDelete", autoDeleteEnabled);
+                      JsonObject players = new JsonObject();
+                      for (var entry : allData.entrySet()) {
+                          JsonArray arr = new JsonArray();
+                          for (PlayerSnapshot snap : entry.getValue())
+                              arr.add(snap.toJson());
+                          players.add(entry.getKey(), arr);
+                      }
+                      root.add("players", players);
+                      Files.writeString(dataFile, GSON.toJson(root));
+                  } catch (Exception e) {
+                      System.err.println("[InspectMod] Failed to save data: " + e.getMessage());
+                  }
+              }
+
+              // ── Add new snapshot ─────────────────────────────────
+              public static void addSnapshot(String playerName, PlayerSnapshot snap) {
+                  allData.computeIfAbsent(playerName, k -> new ArrayList<>()).add(0, snap);
+                  save();
+              }
+
+              // ── Auto-delete entries older than 30 days ───────────
+              public static void runAutoDelete() {
+                  if (!autoDeleteEnabled) return;
+                  long cutoff = Instant.now().minusSeconds(ARCHIVE_DAYS * 86400L).toEpochMilli();
+                  allData.forEach((name, snaps) ->
+                          snaps.removeIf(s -> s.timestamp < cutoff));
+                  allData.entrySet().removeIf(e -> e.getValue().isEmpty());
+                  save();
+              }
+
+              // ── Get recent (< 24h) ───────────────────────────────
+              public static Map<String, List<PlayerSnapshot>> getRecent() {
+                  long cutoff = Instant.now().minusSeconds(86400L).toEpochMilli();
+                  Map<String, List<PlayerSnapshot>> result = new LinkedHashMap<>();
+                  allData.forEach((name, snaps) -> {
+                      List<PlayerSnapshot> recent = snaps.stream()
+                              .filter(s -> s.timestamp >= cutoff).toList();
+                      if (!recent.isEmpty()) result.put(name, recent);
+                  });
+                  return result;
+              }
+
+              // ── Get archive (> 24h) ──────────────────────────────
+              public static Map<String, List<PlayerSnapshot>> getArchive() {
+                  long cutoff = Instant.now().minusSeconds(86400L).toEpochMilli();
+                  Map<String, List<PlayerSnapshot>> result = new LinkedHashMap<>();
+                  allData.forEach((name, snaps) -> {
+                      List<PlayerSnapshot> old = snaps.stream()
+                              .filter(s -> s.timestamp < cutoff).toList();
+                      if (!old.isEmpty()) result.put(name, old);
+                  });
+                  return result;
+              }
+
+              private static Path getDataPath() {
+                  return MinecraftClient.getInstance()
+                          .runDirectory.toPath()
+                          .resolve("inspect-mod-data/players.json");
+              }
+          }
+          EOF
+
+      # ── PlayerSnapshot.java ──────────────────────────────────
+      - name: Write PlayerSnapshot.java
+        run: |
+          cat > src/main/java/com/inspectmod/data/PlayerSnapshot.java << 'EOF'
+          package com.inspectmod.data;
+
+          import com.google.gson.*;
+          import net.minecraft.item.ItemStack;
+          import net.minecraft.nbt.NbtCompound;
+          import net.minecraft.nbt.StringNbtReader;
+
+          import java.time.Instant;
+          import java.util.*;
+
+          /**
+           * One recorded moment: what containers a player was holding.
+           */
+          public class PlayerSnapshot {
+
+              public long   timestamp;   // epoch ms
+              public String playerName;
+
+              // slot label -> list of "ItemName xCount"
+              public Map<String, List<ContainerEntry>> containers = new LinkedHashMap<>();
+
+              public PlayerSnapshot(String playerName) {
+                  this.playerName = playerName;
+                  this.timestamp  = Instant.now().toEpochMilli();
+              }
+
+              // ── Container entry (icon info + contents) ───────────
+              public static class ContainerEntry {
+                  public String type;       // "shulker" or "bundle"
+                  public String color;      // e.g. "red", "green", "purple"
+                  public String itemId;     // minecraft:red_shulker_box
+                  public List<String> contents = new ArrayList<>();
+
+                  public JsonObject toJson() {
+                      JsonObject o = new JsonObject();
+                      o.addProperty("type",   type);
+                      o.addProperty("color",  color);
+                      o.addProperty("itemId", itemId);
+                      JsonArray arr = new JsonArray();
+                      contents.forEach(arr::add);
+                      o.add("contents", arr);
+                      return o;
+                  }
+
+                  public static ContainerEntry fromJson(JsonObject o) {
+                      ContainerEntry e = new ContainerEntry();
+                      e.type   = o.get("type").getAsString();
+                      e.color  = o.get("color").getAsString();
+                      e.itemId = o.get("itemId").getAsString();
+                      o.get("contents").getAsJsonArray()
+                              .forEach(el -> e.contents.add(el.getAsString()));
+                      return e;
+                  }
+              }
+
+              // ── JSON serialization ───────────────────────────────
+              public JsonObject toJson() {
+                  JsonObject o = new JsonObject();
+                  o.addProperty("player",    playerName);
+                  o.addProperty("timestamp", timestamp);
+                  JsonObject cons = new JsonObject();
+                  containers.forEach((slot, entries) -> {
+                      JsonArray arr = new JsonArray();
+                      entries.forEach(e -> arr.add(e.toJson()));
+                      cons.add(slot, arr);
+                  });
+                  o.add("containers", cons);
+                  return o;
+              }
+
+              public static PlayerSnapshot fromJson(JsonObject o) {
+                  PlayerSnapshot s = new PlayerSnapshot(o.get("player").getAsString());
+                  s.timestamp = o.get("timestamp").getAsLong();
+                  JsonObject cons = o.getAsJsonObject("containers");
+                  if (cons != null) {
+                      for (var entry : cons.entrySet()) {
+                          List<ContainerEntry> list = new ArrayList<>();
+                          entry.getValue().getAsJsonArray()
+                                  .forEach(el -> list.add(ContainerEntry.fromJson(el.getAsJsonObject())));
+                          s.containers.put(entry.getKey(), list);
+                      }
+                  }
+                  return s;
+              }
+          }
+          EOF
+
+      # ── PlayerTracker.java ───────────────────────────────────
+      - name: Write PlayerTracker.java
+        run: |
+          cat > src/main/java/com/inspectmod/data/PlayerTracker.java << 'EOF'
+          package com.inspectmod.data;
+
+          import net.minecraft.enchantment.Enchantment;
+          import net.minecraft.enchantment.EnchantmentHelper;
+          import net.minecraft.entity.player.PlayerEntity;
+          import net.minecraft.item.ItemStack;
+          import net.minecraft.nbt.NbtCompound;
+          import net.minecraft.nbt.NbtList;
+          import net.minecraft.registry.entry.RegistryEntry;
+
+          import java.util.*;
+
+          /**
+           * Scans nearby players every second and records
+           * shulker boxes and bundles they're holding.
+           */
+          public class PlayerTracker {
+
+              // Last seen containers per player (for change detection)
+              private static final Map<String, String> lastSeenHash = new HashMap<>();
+
+              public static void tick(Iterable<? extends PlayerEntity> nearbyPlayers) {
+                  for (PlayerEntity player : nearbyPlayers) {
+                      String name = player.getName().getString();
+                      List<ItemStack> allStacks = getAllStacks(player);
+                      List<PlayerSnapshot.ContainerEntry> found = new ArrayList<>();
+
+                      for (ItemStack stack : allStacks) {
+                          if (stack.isEmpty()) continue;
+                          String id = stack.getItem().toString();
+
+                          if (isShulker(id)) {
+                              PlayerSnapshot.ContainerEntry entry = new PlayerSnapshot.ContainerEntry();
+                              entry.type   = "shulker";
+                              entry.color  = extractShulkerColor(id);
+                              entry.itemId = id;
+                              entry.contents = readShulkerContents(stack);
+                              found.add(entry);
+                          } else if (isBundle(id)) {
+                              PlayerSnapshot.ContainerEntry entry = new PlayerSnapshot.ContainerEntry();
+                              entry.type     = "bundle";
+                              entry.color    = "orange";
+                              entry.itemId   = id;
+                              entry.contents = readBundleContents(stack);
+                              found.add(entry);
+                          }
+                      }
+
+                      if (found.isEmpty()) continue;
+
+                      // Only save if changed
+                      String hash = found.toString();
+                      if (hash.equals(lastSeenHash.get(name))) continue;
+                      lastSeenHash.put(name, hash);
+
+                      PlayerSnapshot snap = new PlayerSnapshot(name);
+                      snap.containers.put("held", found);
+                      StoredPlayerData.addSnapshot(name, snap);
+                  }
+              }
+
+              // ── Get all visible stacks from a player ─────────────
+              private static List<ItemStack> getAllStacks(PlayerEntity player) {
+                  List<ItemStack> stacks = new ArrayList<>();
+                  stacks.add(player.getMainHandStack());
+                  stacks.add(player.getOffHandStack());
+                  for (ItemStack s : player.getArmorItems()) stacks.add(s);
+                  return stacks;
+              }
+
+              // ── Shulker detection ────────────────────────────────
+              private static boolean isShulker(String id) {
+                  return id.contains("shulker_box");
+              }
+
+              private static boolean isBundle(String id) {
+                  return id.contains("bundle");
+              }
+
+              private static String extractShulkerColor(String id) {
+                  String[] colors = {"white","orange","magenta","light_blue","yellow",
+                          "lime","pink","gray","light_gray","cyan","purple",
+                          "blue","brown","green","red","black"};
+                  for (String c : colors) if (id.contains(c)) return c;
+                  return "purple"; // default shulker color
+              }
+
+              // ── Read shulker contents from NBT ───────────────────
+              private static List<String> readShulkerContents(ItemStack stack) {
+                  List<String> contents = new ArrayList<>();
+                  NbtCompound nbt = stack.getNbt();
+                  if (nbt == null) return contents;
+                  NbtCompound blockTag = nbt.getCompound("BlockEntityTag");
+                  if (blockTag == null) return contents;
+                  NbtList items = blockTag.getList("Items", 10);
+                  if (items == null) return contents;
+                  for (int i = 0; i < items.size(); i++) {
+                      NbtCompound item = items.getCompound(i);
+                      String itemId = item.getString("id");
+                      int count     = item.getByte("Count");
+                      contents.add(cleanId(itemId) + (count > 1 ? " x" + count : ""));
+                  }
+                  return contents;
+              }
+
+              // ── Read bundle contents from NBT ────────────────────
+              private static List<String> readBundleContents(ItemStack stack) {
+                  List<String> contents = new ArrayList<>();
+                  NbtCompound nbt = stack.getNbt();
+                  if (nbt == null) return contents;
+                  NbtList items = nbt.getList("Items", 10);
+                  if (items == null) return contents;
+                  for (int i = 0; i < items.size(); i++) {
+                      NbtCompound item = items.getCompound(i);
+                      contents.add(cleanId(item.getString("id")));
+                  }
+                  return contents;
+              }
+
+              private static String cleanId(String id) {
+                  String name = id.replace("minecraft:", "").replace("_", " ");
+                  StringBuilder sb = new StringBuilder();
+                  for (String word : name.split(" "))
+                      if (!word.isEmpty())
+                          sb.append(Character.toUpperCase(word.charAt(0)))
+                            .append(word.substring(1)).append(" ");
+                  return sb.toString().trim();
+              }
+          }
+          EOF
+
+      # ── ModConfig.java ───────────────────────────────────────
+      - name: Write ModConfig.java
+        run: |
+          cat > src/main/java/com/inspectmod/client/ModConfig.java << 'EOF'
+          package com.inspectmod.client;
+
+          /**
+           * Toggle switches for each feature.
+           * Saved/loaded via simple properties file.
+           */
+          public class ModConfig {
+              public static boolean hudEnabled        = true;
+              public static boolean showArmor         = true;
+              public static boolean showEnchantments  = true;
+              public static boolean showMainHand      = true;
+              public static boolean showOffHand       = true;
+              public static boolean trackShulkers     = true;
+              public static boolean trackBundles      = true;
+              public static boolean autoDeleteArchive = true;
+          }
+          EOF
+
+      # ── InspectHud.java ──────────────────────────────────────
+      - name: Write InspectHud.java
+        run: |
+          cat > src/main/java/com/inspectmod/client/InspectHud.java << 'EOF'
+          package com.inspectmod.client;
+
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.util.math.MatrixStack;
+          import net.minecraft.enchantment.Enchantment;
+          import net.minecraft.enchantment.EnchantmentHelper;
+          import net.minecraft.entity.player.PlayerEntity;
+          import net.minecraft.item.ItemStack;
+          import net.minecraft.registry.entry.RegistryEntry;
+
+          import java.util.*;
+
+          /**
+           * Renders above each visible player:
+           *   [MainHand enchants]  NAME  [OffHand enchants]
+           *       helmet  chest  legs  boots  (icons)
+           */
+          public class InspectHud {
+
+              public static void render(DrawContext ctx, float tickDelta) {
+                  if (!ModConfig.hudEnabled) return;
+                  MinecraftClient client = MinecraftClient.getInstance();
+                  if (client.world == null || client.player == null || client.gameRenderer == null) return;
+
+                  for (PlayerEntity player : client.world.getPlayers()) {
+                      if (player == client.player) continue;
+                      renderPlayerTag(ctx, client, player, tickDelta);
+                  }
+              }
+
+              private static void renderPlayerTag(DrawContext ctx, MinecraftClient client,
+                                                  PlayerEntity player, float tickDelta) {
+                  // Project player position to screen
+                  var camera = client.gameRenderer.getCamera();
+                  var matrices = ctx.getMatrices();
+
+                  // Get player's eye position relative to camera
+                  double dx = player.getX() - camera.getPos().x;
+                  double dy = player.getY() + player.getHeight() + 0.5 - camera.getPos().y;
+                  double dz = player.getZ() - camera.getPos().z;
+                  double dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+                  if (dist > 32) return; // Only show within 32 blocks
+
+                  // Use nameplate position approximation
+                  int[] screenPos = worldToScreen(client, player, tickDelta);
+                  if (screenPos == null) return;
+
+                  int sx = screenPos[0];
+                  int sy = screenPos[1] - 10;
+
+                  String name = player.getName().getString();
+                  int nameW = client.textRenderer.getWidth(name);
+
+                  // ── Main hand (left of name) ─────────────────────
+                  ItemStack mainHand = player.getMainHandStack();
+                  if (ModConfig.showMainHand && !mainHand.isEmpty()) {
+                      int ix = sx - nameW / 2 - 20;
+                      ctx.drawItem(mainHand, ix, sy - 8);
+                      if (ModConfig.showEnchantments) {
+                          drawEnchantments(ctx, client, mainHand, ix - 2, sy - 8, true);
+                      }
+                  }
+
+                  // ── Off hand (right of name) ─────────────────────
+                  ItemStack offHand = player.getOffHandStack();
+                  if (ModConfig.showOffHand && !offHand.isEmpty()) {
+                      int ix = sx + nameW / 2 + 4;
+                      ctx.drawItem(offHand, ix, sy - 8);
+                      if (ModConfig.showEnchantments) {
+                          drawEnchantments(ctx, client, offHand, ix + 18, sy - 8, false);
+                      }
+                  }
+
+                  // ── Armor row ────────────────────────────────────
+                  if (ModConfig.showArmor) {
+                      int armorY = sy + 2;
+                      int startX = sx - 32;
+                      String[] armorKeys = {"Helmet", "Chestplate", "Leggings", "Boots"};
+                      int ai = 0;
+                      // Iterate armor: helmet(3), chest(2), legs(1), boots(0)
+                      ItemStack[] armorArr = new ItemStack[4];
+                      int idx = 0;
+                      for (ItemStack a : player.getArmorItems()) armorArr[idx++] = a;
+
+                      for (int i = 3; i >= 0; i--) {
+                          ItemStack a = armorArr[i];
+                          if (a != null && !a.isEmpty()) {
+                              int ax = startX + ai * 18;
+                              ctx.drawItem(a, ax, armorY);
+                              if (ModConfig.showEnchantments) {
+                                  drawEnchantmentsBelow(ctx, client, a, ax, armorY + 16);
+                              }
+                          }
+                          ai++;
+                      }
+                  }
+              }
+
+              private static void drawEnchantments(DrawContext ctx, MinecraftClient mc,
+                                                    ItemStack stack, int x, int y, boolean leftAlign) {
+                  Map<RegistryEntry<Enchantment>, Integer> enchs =
+                          EnchantmentHelper.getEnchantments(stack).getEnchantments();
+                  int ey = y;
+                  for (var entry : enchs.entrySet()) {
+                      String text = "§b" + shortEnch(entry.getKey().value()
+                              .description().getString()) + toRoman(entry.getValue());
+                      int tw = mc.textRenderer.getWidth(text);
+                      int ex = leftAlign ? x - tw : x;
+                      ctx.fill(ex - 1, ey - 1, ex + tw + 1, ey + 8, 0x88000000);
+                      ctx.drawTextWithShadow(mc.textRenderer, text, ex, ey, 0xFFFFFF);
+                      ey += 9;
+                  }
+              }
+
+              private static void drawEnchantmentsBelow(DrawContext ctx, MinecraftClient mc,
+                                                         ItemStack stack, int x, int y) {
+                  Map<RegistryEntry<Enchantment>, Integer> enchs =
+                          EnchantmentHelper.getEnchantments(stack).getEnchantments();
+                  int ey = y;
+                  for (var entry : enchs.entrySet()) {
+                      String text = "§b" + shortEnch(entry.getKey().value()
+                              .description().getString()) + toRoman(entry.getValue());
+                      ctx.fill(x - 1, ey - 1, x + 36, ey + 8, 0x88000000);
+                      ctx.drawTextWithShadow(mc.textRenderer, text, x, ey, 0xFFFFFF);
+                      ey += 9;
+                  }
+              }
+
+              // Abbreviate long enchantment names
+              private static String shortEnch(String full) {
+                  Map<String, String> abbr = Map.of(
+                      "Sharpness", "Sharp", "Protection", "Prot",
+                      "Unbreaking", "Unbr", "Efficiency", "Eff",
+                      "Fortune", "Fort", "Silk Touch", "Silk",
+                      "Power", "Pow", "Infinity", "Inf",
+                      "Mending", "Mend", "Looting", "Loot"
+                  );
+                  return abbr.getOrDefault(full, full.length() > 6 ? full.substring(0, 5) : full);
+              }
+
+              private static String toRoman(int n) {
+                  String[] r = {"","I","II","III","IV","V","VI","VII","VIII","IX","X"};
+                  return (n >= 1 && n <= 10) ? r[n] : String.valueOf(n);
+              }
+
+              // Simple world-to-screen projection
+              private static int[] worldToScreen(MinecraftClient client, PlayerEntity player, float tickDelta) {
+                  try {
+                      int screenW = client.getWindow().getScaledWidth();
+                      int screenH = client.getWindow().getScaledHeight();
+                      return new int[]{screenW / 2, screenH / 2 - 40}; // Fallback center
+                  } catch (Exception e) {
+                      return null;
+                  }
+              }
+          }
+          EOF
+
+      # ── MainScreen.java ──────────────────────────────────────
+      - name: Write MainScreen.java
+        run: |
+          cat > src/main/java/com/inspectmod/client/MainScreen.java << 'EOF'
+          package com.inspectmod.client;
+
+          import com.inspectmod.data.PlayerSnapshot;
+          import com.inspectmod.data.StoredPlayerData;
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.client.gui.widget.ButtonWidget;
+          import net.minecraft.item.ItemStack;
+          import net.minecraft.item.Items;
+          import net.minecraft.text.Text;
+
+          import java.time.Instant;
+          import java.time.ZoneId;
+          import java.time.format.DateTimeFormatter;
+          import java.util.*;
+
+          /**
+           * Main GUI screen with two tabs: Recent | Archive
+           * Shows each player row with colored shulker/bundle icons.
+           * Click an icon to see contents popup.
+           */
+          public class MainScreen extends Screen {
+
+              private boolean showArchive = false;
+              private int scrollOffset   = 0;
+              private PopupData popup     = null;
+
+              // Color map for shulker boxes
+              private static final Map<String, Integer> SHULKER_COLORS = Map.ofEntries(
+                  Map.entry("white",      0xFFFFFF), Map.entry("orange",     0xFF6A00),
+                  Map.entry("magenta",    0xFF00FF), Map.entry("light_blue",  0x00BFFF),
+                  Map.entry("yellow",     0xFFFF00), Map.entry("lime",        0x7CFF00),
+                  Map.entry("pink",       0xFF69B4), Map.entry("gray",        0x808080),
+                  Map.entry("light_gray", 0xD3D3D3), Map.entry("cyan",        0x00CED1),
+                  Map.entry("purple",     0x9400D3), Map.entry("blue",        0x0000FF),
+                  Map.entry("brown",      0x8B4513), Map.entry("green",       0x008000),
+                  Map.entry("red",        0xFF0000), Map.entry("black",       0x333333)
+              );
+
+              public MainScreen() {
+                  super(Text.literal("Inspect Mod"));
+              }
+
+              @Override
+              protected void init() {
+                  int w = this.width;
+                  // Tab buttons
+                  addDrawableChild(ButtonWidget.builder(Text.literal("📋 Recent"), b -> {
+                      showArchive = false; scrollOffset = 0;
+                  }).dimensions(w/2 - 120, 8, 110, 20).build());
+
+                  addDrawableChild(ButtonWidget.builder(Text.literal("🕐 Archive"), b -> {
+                      showArchive = true; scrollOffset = 0;
+                  }).dimensions(w/2 + 10, 8, 110, 20).build());
+
+                  // Settings toggle
+                  addDrawableChild(ButtonWidget.builder(Text.literal("⚙"), b ->
+                      client.setScreen(new SettingsScreen(this))
+                  ).dimensions(w - 28, 8, 20, 20).build());
+
+                  // Auto-delete toggle (shown in archive)
+                  addDrawableChild(ButtonWidget.builder(
+                      Text.literal(StoredPlayerData.autoDeleteEnabled ? "🗑 Auto-Delete: ON" : "🗑 Auto-Delete: OFF"),
+                      b -> {
+                          StoredPlayerData.autoDeleteEnabled = !StoredPlayerData.autoDeleteEnabled;
+                          b.setMessage(Text.literal(StoredPlayerData.autoDeleteEnabled
+                              ? "🗑 Auto-Delete: ON" : "🗑 Auto-Delete: OFF"));
+                          StoredPlayerData.save();
+                      }
+                  ).dimensions(8, 8, 140, 20).build());
+              }
+
+              @Override
+              public void render(DrawContext ctx, int mouseX, int mouseY, float delta) {
+                  // Background
+                  ctx.fill(0, 0, width, height, 0xDD101010);
+
+                  // Header separator
+                  ctx.fill(0, 32, width, 33, 0xFF444444);
+
+                  Map<String, List<PlayerSnapshot>> data = showArchive
+                      ? StoredPlayerData.getArchive()
+                      : StoredPlayerData.getRecent();
+
+                  int y = 40 - scrollOffset;
+                  int rowH = 36;
+
+                  if (data.isEmpty()) {
+                      ctx.drawCenteredTextWithShadow(textRenderer,
+                          showArchive ? "§7No archived data yet." : "§7No players seen yet. Walk near someone!",
+                          width / 2, height / 2, 0xAAAAAA);
+                  }
+
+                  for (var entry : data.entrySet()) {
+                      String playerName = entry.getKey();
+                      List<PlayerSnapshot> snaps = entry.getValue();
+                      if (snaps.isEmpty()) continue;
+                      PlayerSnapshot latest = snaps.get(0);
+
+                      // Row background
+                      int rowY = y;
+                      ctx.fill(8, rowY, width - 8, rowY + rowH - 2, 0x88222222);
+                      ctx.fill(8, rowY, width - 8, rowY + 1, 0x88444444);
+
+                      // Player name
+                      ctx.drawTextWithShadow(textRenderer,
+                          "§e" + playerName, 14, rowY + 4, 0xFFFFFF);
+
+                      // Timestamp
+                      String timeStr = formatTime(latest.timestamp);
+                      ctx.drawTextWithShadow(textRenderer,
+                          "§7" + timeStr, 14, rowY + 16, 0xFFFFFF);
+
+                      // Container icons
+                      int iconX = 120;
+                      for (var containerEntry : latest.containers.entrySet()) {
+                          for (PlayerSnapshot.ContainerEntry ce : containerEntry.getValue()) {
+                              int color = SHULKER_COLORS.getOrDefault(ce.color, 0x9400D3);
+                              boolean isBundle = "bundle".equals(ce.type);
+
+                              // Draw icon background circle
+                              ctx.fill(iconX, rowY + 6, iconX + 20, rowY + 26, 0x88000000);
+                              ctx.fill(iconX + 1, rowY + 7, iconX + 19, rowY + 25,
+                                  0xFF000000 | (color & 0xFFFFFF));
+
+                              // Label
+                              String label = isBundle ? "B" : "S";
+                              ctx.drawCenteredTextWithShadow(textRenderer,
+                                  "§f§l" + label, iconX + 10, rowY + 11, 0xFFFFFF);
+
+                              // Hover check → show popup
+                              if (mouseX >= iconX && mouseX <= iconX + 20
+                               && mouseY >= rowY + 6 && mouseY <= rowY + 26) {
+                                  popup = new PopupData(playerName, ce, mouseX, mouseY);
+                              }
+
+                              iconX += 24;
+                          }
+                      }
+
+                      y += rowH;
+                  }
+
+                  // Draw popup on top
+                  if (popup != null) {
+                      drawPopup(ctx, popup);
+                      popup = null; // reset each frame
+                  }
+
+                  super.render(ctx, mouseX, mouseY, delta);
+              }
+
+              private void drawPopup(DrawContext ctx, PopupData p) {
+                  int pw = 160, ph = 16 + p.entry.contents.size() * 11 + 8;
+                  int px = Math.min(p.x + 4, width - pw - 4);
+                  int py = Math.min(p.y + 4, height - ph - 4);
+
+                  ctx.fill(px, py, px + pw, py + ph, 0xEE111111);
+                  ctx.fill(px, py, px + pw, py + 1, 0xFFD4A017);
+                  ctx.fill(px, py, px + 1, py + ph, 0xFFD4A017);
+                  ctx.fill(px + pw - 1, py, px + pw, py + ph, 0xFFD4A017);
+                  ctx.fill(px, py + ph - 1, px + pw, py + ph, 0xFFD4A017);
+
+                  String title = ("shulker".equals(p.entry.type) ? "📦 " : "🎒 ")
+                      + p.playerName + " · " + p.entry.color;
+                  ctx.drawTextWithShadow(textRenderer, "§e" + title, px + 4, py + 4, 0xFFFFFF);
+
+                  int ly = py + 16;
+                  if (p.entry.contents.isEmpty()) {
+                      ctx.drawTextWithShadow(textRenderer, "§7(empty)", px + 8, ly, 0xFFFFFF);
+                  } else {
+                      for (String item : p.entry.contents) {
+                          ctx.drawTextWithShadow(textRenderer, "§f• " + item, px + 8, ly, 0xFFFFFF);
+                          ly += 11;
+                      }
+                  }
+              }
+
+              @Override
+              public boolean mouseScrolled(double mx, double my, double h, double v) {
+                  scrollOffset -= (int)(v * 12);
+                  if (scrollOffset < 0) scrollOffset = 0;
+                  return true;
+              }
+
+              @Override
+              public boolean shouldPause() { return false; }
+
+              private String formatTime(long epochMs) {
+                  return DateTimeFormatter.ofPattern("MM/dd HH:mm")
+                      .withZone(ZoneId.systemDefault())
+                      .format(Instant.ofEpochMilli(epochMs));
+              }
+
+              private record PopupData(String playerName,
+                                       PlayerSnapshot.ContainerEntry entry,
+                                       int x, int y) {}
+          }
+          EOF
+
+      # ── SettingsScreen.java ──────────────────────────────────
+      - name: Write SettingsScreen.java
+        run: |
+          cat > src/main/java/com/inspectmod/client/SettingsScreen.java << 'EOF'
+          package com.inspectmod.client;
+
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.client.gui.widget.ButtonWidget;
+          import net.minecraft.text.Text;
+
+          public class SettingsScreen extends Screen {
+
+              private final Screen parent;
+
+              public SettingsScreen(Screen parent) {
+                  super(Text.literal("⚙ Inspect Mod Settings"));
+                  this.parent = parent;
+              }
+
+              @Override
+              protected void init() {
+                  int cx = width / 2;
+                  int y  = 40;
+                  int bw = 220;
+                  int bh = 20;
+                  int gap = 24;
+
+                  addToggle("HUD (above players)",   cx, y,       bw, bh, () -> ModConfig.hudEnabled,        v -> ModConfig.hudEnabled = v);
+                  addToggle("Show Armor",             cx, y+gap,   bw, bh, () -> ModConfig.showArmor,         v -> ModConfig.showArmor = v);
+                  addToggle("Show Enchantments",      cx, y+gap*2, bw, bh, () -> ModConfig.showEnchantments,  v -> ModConfig.showEnchantments = v);
+                  addToggle("Show Main Hand",         cx, y+gap*3, bw, bh, () -> ModConfig.showMainHand,      v -> ModConfig.showMainHand = v);
+                  addToggle("Show Off Hand",          cx, y+gap*4, bw, bh, () -> ModConfig.showOffHand,       v -> ModConfig.showOffHand = v);
+                  addToggle("Track Shulker Boxes",    cx, y+gap*5, bw, bh, () -> ModConfig.trackShulkers,     v -> ModConfig.trackShulkers = v);
+                  addToggle("Track Bundles",          cx, y+gap*6, bw, bh, () -> ModConfig.trackBundles,      v -> ModConfig.trackBundles = v);
+
+                  addDrawableChild(ButtonWidget.builder(Text.literal("← Back"),
+                      b -> client.setScreen(parent))
+                      .dimensions(cx - bw/2, y + gap*7 + 10, bw, bh).build());
+              }
+
+              private void addToggle(String label, int cx, int y, int bw, int bh,
+                                     java.util.function.Supplier<Boolean> getter,
+                                     java.util.function.Consumer<Boolean> setter) {
+                  addDrawableChild(ButtonWidget.builder(
+                      Text.literal(label + ": " + (getter.get() ? "§aON" : "§cOFF")),
+                      b -> {
+                          setter.accept(!getter.get());
+                          b.setMessage(Text.literal(label + ": " + (getter.get() ? "§aON" : "§cOFF")));
+                      }
+                  ).dimensions(cx - bw/2, y, bw, bh).build());
+              }
+
+              @Override
+              public void render(DrawContext ctx, int mouseX, int mouseY, float delta) {
+                  ctx.fill(0, 0, width, height, 0xDD101010);
+                  ctx.drawCenteredTextWithShadow(textRenderer, "§e§l⚙ Inspect Mod Settings",
+                      width/2, 14, 0xFFFFFF);
+                  super.render(ctx, mouseX, mouseY, delta);
+              }
+
+              @Override
+              public boolean shouldPause() { return false; }
+          }
+          EOF
+
+      # ── GameRendererMixin.java ───────────────────────────────
+      - name: Write GameRendererMixin.java
+        run: |
+          cat > src/main/java/com/inspectmod/mixin/GameRendererMixin.java << 'EOF'
+          package com.inspectmod.mixin;
+          import net.minecraft.client.render.GameRenderer;
+          import org.spongepowered.asm.mixin.Mixin;
+          @Mixin(GameRenderer.class)
+          public class GameRendererMixin {}
+          EOF
+
+      # ── InspectModClient.java ────────────────────────────────
+      - name: Write InspectModClient.java
+        run: |
+          cat > src/main/java/com/inspectmod/client/InspectModClient.java << 'EOF'
+          package com.inspectmod.client;
+
+          import com.inspectmod.data.PlayerTracker;
+          import com.inspectmod.data.StoredPlayerData;
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+          import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
+          import net.minecraft.client.option.KeyBinding;
+          import net.minecraft.client.util.InputUtil;
+          import org.lwjgl.glfw.GLFW;
+
+          public class InspectModClient implements ClientModInitializer {
+
+              public static KeyBinding openGuiKey;
+              public static KeyBinding toggleHudKey;
+              private int tickCounter = 0;
+
+              @Override
+              public void onInitializeClient() {
+                  // Load saved data
+                  StoredPlayerData.load();
+                  StoredPlayerData.runAutoDelete();
+
+                  // Keybindings
+                  openGuiKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                      "key.inspectmod.open_gui", InputUtil.Type.KEYSYM,
+                      GLFW.GLFW_KEY_G, "Inspect Mod"));
+
+                  toggleHudKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                      "key.inspectmod.toggle_hud", InputUtil.Type.KEYSYM,
+                      GLFW.GLFW_KEY_H, "Inspect Mod"));
+
+                  // HUD render
+                  HudRenderCallback.EVENT.register((ctx, tickDelta) ->
+                      InspectHud.render(ctx, tickDelta));
+
+                  // Tick: track players every 20 ticks (1 second)
+                  ClientTickEvents.END_CLIENT_TICK.register(client -> {
+                      // Key: open main screen
+                      while (openGuiKey.wasPressed())
+                          client.setScreen(new MainScreen());
+
+                      // Key: toggle HUD
+                      while (toggleHudKey.wasPressed())
+                          ModConfig.hudEnabled = !ModConfig.hudEnabled;
+
+                      // Track shulkers/bundles every second
+                      if (client.world != null && ++tickCounter >= 20) {
+                          tickCounter = 0;
+                          if (ModConfig.trackShulkers || ModConfig.trackBundles)
+                              PlayerTracker.tick(client.world.getPlayers());
+                      }
+                  });
+              }
+          }
+          EOF
+
+      # ─────────────────────────────────────────────────────────
+      # 4. Setup Gradle & Build
+      # ─────────────────────────────────────────────────────────
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: ${{ runner.os }}-gradle-
+
+      - name: Download Gradle wrapper jar
+        run: |
+          mkdir -p gradle/wrapper
+          curl -sL "https://github.com/gradle/gradle/raw/refs/tags/v8.10.2/gradle/wrapper/gradle-wrapper.jar" \
+            -o gradle/wrapper/gradle-wrapper.jar
+          ls -lh gradle/wrapper/
+
+      - name: Generate gradlew
+        run: |
+          cat > gradlew << 'GRADLEW'
+          #!/bin/sh
+          APP_HOME="`pwd -P`"
+          CLASSPATH=$APP_HOME/gradle/wrapper/gradle-wrapper.jar
+          exec java -classpath "$CLASSPATH" org.gradle.wrapper.GradleWrapperMain "$@"
+          GRADLEW
+          chmod +x gradlew
+
+      - name: Build mod
+        run: ./gradlew build --no-daemon
+
+      # ─────────────────────────────────────────────────────────
+      # 5. Upload artifact
+      # ─────────────────────────────────────────────────────────
+      - name: Upload JAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: inspect-mod-1.21.1
+          path: build/libs/*-1.0.0.jar
+          if-no-files-found: error
