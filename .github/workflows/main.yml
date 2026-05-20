@@ -368,12 +368,13 @@ jobs:
           }
           EOF
 
-      # ── PlayerTracker.java ───────────────────────────────────
+      # ── PlayerTracker.java (FIXED) ───────────────────────────
       - name: Write PlayerTracker.java
         run: |
           cat > src/main/java/com/inspectmod/data/PlayerTracker.java << 'EOF'
           package com.inspectmod.data;
 
+          import com.inspectmod.client.ModConfig;
           import net.minecraft.component.DataComponentTypes;
           import net.minecraft.component.type.BundleContentsComponent;
           import net.minecraft.component.type.ContainerComponent;
@@ -453,7 +454,6 @@ jobs:
               // ── Shulker: uses ContainerComponent (1.21.1 Data Components) ──
               private static List<String> readShulkerContents(ItemStack stack) {
                   List<String> contents = new ArrayList<>();
-                  // CONTAINER component holds shulker box items in 1.21.1
                   ContainerComponent container = stack.get(DataComponentTypes.CONTAINER);
                   if (container == null) return contents;
                   for (ItemStack item : container.iterateNonEmpty()) {
@@ -468,10 +468,11 @@ jobs:
                   List<String> contents = new ArrayList<>();
                   BundleContentsComponent bundle = stack.get(DataComponentTypes.BUNDLE_CONTENTS);
                   if (bundle == null) return contents;
-                  for (ItemStack item : bundle.iterateNonEmpty()) {
+                  // استخدام stream() بدلاً من iterateNonEmpty()
+                  bundle.stream().forEach(item -> {
                       contents.add(cleanId(item.getItem().toString())
                               + (item.getCount() > 1 ? " x" + item.getCount() : ""));
-                  }
+                  });
                   return contents;
               }
 
@@ -605,8 +606,6 @@ jobs:
               // ── Draw enchantments left or right of an item icon ──
               private static void drawEnchantments(DrawContext ctx, MinecraftClient mc,
                                                    ItemStack stack, int x, int y, boolean leftAlign) {
-                  // In 1.21.1 getEnchantments() returns ItemEnchantmentsComponent
-                  // iterate with getEnchantmentEntries() which gives Set<RegistryEntry<Enchantment>>
                   var component = EnchantmentHelper.getEnchantments(stack);
                   int ey = y;
                   for (RegistryEntry<Enchantment> entry : component.getEnchantments()) {
