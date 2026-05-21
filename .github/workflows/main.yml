@@ -358,8 +358,8 @@ jobs:
                   List<String> out = new ArrayList<>();
                   ContainerComponent c = stack.get(DataComponentTypes.CONTAINER);
                   if (c == null) return out;
-                  // iterate() returns all slots; we skip empty
-                  for (ItemStack item : c.iterate()) {
+                  // stacks() returns List<ItemStack> in 1.21.1
+                  for (ItemStack item : c.stacks()) {
                       if (!item.isEmpty())
                           out.add(cleanId(item.getItem().toString())
                               + (item.getCount() > 1 ? " x" + item.getCount() : ""));
@@ -371,8 +371,8 @@ jobs:
                   List<String> out = new ArrayList<>();
                   BundleContentsComponent b = stack.get(DataComponentTypes.BUNDLE_CONTENTS);
                   if (b == null) return out;
-                  // BundleContentsComponent implements Iterable<ItemStack> in 1.21.1
-                  for (ItemStack item : b) {
+                  // getStacks() returns List<ItemStack> in 1.21.1
+                  for (ItemStack item : b.getStacks()) {
                       if (!item.isEmpty())
                           out.add(cleanId(item.getItem().toString())
                               + (item.getCount() > 1 ? " x" + item.getCount() : ""));
