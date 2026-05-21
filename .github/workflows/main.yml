@@ -408,7 +408,6 @@ jobs:
           import net.minecraft.component.DataComponentTypes;
           import net.minecraft.enchantment.Enchantment;
           import net.minecraft.item.ItemStack;
-          import net.minecraft.item.equipment.trim.ArmorTrim;
           import net.minecraft.registry.entry.RegistryEntry;
           import net.minecraft.entity.player.PlayerEntity;
 
